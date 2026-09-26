@@ -243,6 +243,71 @@ def main() -> None:
         assert len(no_ksu) == 1 and "kernelsu" not in no_ksu[0], no_ksu
         assert "exploit" in no_ksu[0]
         print("PASS add-feed-entry without kernelsu: entry has no kernelsu field, feed stays valid JSON")
+
+        # The `sha256` and `version` inside a `kernelsu` block, and the entry's
+        # top-level `flavor`, are all written where a pair is built (the payloads
+        # repo's `update_feed.py --create`), and a port owns none of them.
+        # Replacing an entry wholesale used to drop all three: the app is then
+        # offered a daemon it cannot verify, and a `kernelsu-next` payload reads
+        # back as plain KernelSU. Seed the feed with an entry in the shape that
+        # tool writes, re-port it, and demand the feed come back byte-identical -
+        # nothing this tool does not own may move.
+        from rmg_porter.cli import serialize_payload_entry, sha256_file
+
+        # a feed URL is built from the checkout's own remote owner, so the
+        # fixture has to name the owner this temp checkout reports
+        subprocess.run(["git", "init", "-q", str(payloads)], check=True)
+        subprocess.run(["git", "-C", str(payloads), "remote", "add", "origin",
+                        "https://github.com/rushiranpise/Root-My-Galaxy-Payloads.git"], check=True)
+        prefix = "https://raw.githubusercontent.com/rushiranpise/Root-My-Galaxy-Payloads/main/"
+        ksud = payloads / "kernelsu" / "ksud-s25u-kdp"
+        exploit = payloads / "artifacts" / PROFILE / "cve-2026-43499-app.so"
+        paired_id = "pa3q-S938USQSCCZF9-rsksu420"
+        paired = {
+            "payloadId": paired_id,
+            "displayName": "Galaxy Test | ReSukiSU 4.2.0-rc3 (test)",
+            "models": ["SM-S721N"],
+            "kernelVersions": ["6.1.157"],
+            "flavor": "resukisu",
+            "requiresFreshP0Session": True,
+            "exploit": {"url": f"{prefix}artifacts/{PROFILE}/cve-2026-43499-app.so",
+                        "size": exploit.stat().st_size},
+            "kernelsu": {"url": f"{prefix}kernelsu/ksud-s25u-kdp",
+                         "size": ksud.stat().st_size,
+                         "sha256": sha256_file(ksud),
+                         "version": "4.2.0-rc3"},
+        }
+        feed_path = payloads / "support" / "targets-v3.json"
+        # read_text normalises to LF, as the tool reads it; convert back to the
+        # file's own line endings at write time, the way the tool does
+        feed_text = feed_path.read_text(encoding="utf-8")
+        close = feed_text.rfind("]")
+        feed_text = (feed_text[:close].rstrip() + ",\n" + serialize_payload_entry(paired) + "\n"
+                     + feed_text[close:])
+        feed_path.write_text(feed_text.replace("\n", "\r\n"), encoding="utf-8", newline="")
+        seeded_bytes = feed_path.read_bytes()
+        run(["add-feed-entry", "--payloads-repo", str(payloads), "--profile", paired_id,
+             "--payload-id", paired_id, "--display-name", paired["displayName"],
+             "--model", paired["models"][0], "--kernel-version", paired["kernelVersions"][0],
+             "--exploit-path", str(exploit), "--kernelsu-path", str(ksud),
+             "--preserve-existing-metadata"], cwd=REPO)
+        assert feed_path.read_bytes() == seeded_bytes, (
+            f"re-port of {paired_id} must leave the feed byte-identical"
+        )
+        kept = [p for p in json.loads(seeded_bytes.decode("utf-8"))["payloads"]
+                if p["payloadId"] == paired_id][0]
+        assert kept["flavor"] == "resukisu", kept
+        assert kept["kernelsu"]["sha256"] == paired["kernelsu"]["sha256"], kept
+        assert kept["kernelsu"]["version"] == "4.2.0-rc3", kept
+        print(f"PASS add-feed-entry preserves flavor/sha256/version: re-porting {paired_id} "
+              "leaves the feed byte-identical")
+
+        # ...and a fresh entry still gets a digest for the daemon it names, so a
+        # newly ported target is offered a download the app can verify.
+        fresh = [p for p in json.loads(feed_path.read_text(encoding="utf-8"))["payloads"]
+                 if p["payloadId"] == PROFILE][0]
+        assert fresh["kernelsu"]["sha256"] == sha256_file(ksud), fresh
+        print("PASS add-feed-entry writes the kernelsu digest: a new entry's sha256 is the daemon's own")
         run(["validate-feed", "--payloads-repo", str(payloads)], cwd=REPO)
         run(["validate-port", "--payloads-repo", str(payloads), "--profile", PROFILE,
              "--version", FOUR_PART, "--kernel-version", KERNEL_VERSION,

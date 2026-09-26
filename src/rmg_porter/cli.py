@@ -1713,6 +1713,9 @@ def cmd_add_feed_entry(args: argparse.Namespace) -> int:
     existing = existing_entries[0] if existing_entries else {}
     exploit_rel = args.exploit_path.resolve().relative_to(repo.resolve()).as_posix()
     raw_prefix = f"https://raw.githubusercontent.com/{payloads_owner(repo)}/Root-My-Galaxy-Payloads/main/"
+    # Fields are written in the order the feed carries them, so a rewrite of an
+    # unchanged entry reformats nothing and its commit diff is the lines that
+    # actually moved.
     entry = {
         "payloadId": payload_id,
         "displayName": existing.get("displayName", args.display_name)
@@ -1724,23 +1727,43 @@ def cmd_add_feed_entry(args: argparse.Namespace) -> int:
         "kernelVersions": existing.get("kernelVersions", sorted(set(args.kernel_version)))
         if args.preserve_existing_metadata
         else sorted(set(args.kernel_version)),
-        "exploit": {
-            "url": f"{raw_prefix}{exploit_rel}",
-            "size": args.exploit_path.stat().st_size,
-        },
+    }
+    # `flavor` names the KernelSU fork the app has to match. This tool never
+    # builds a fork into existence, so it cannot invent the value - but losing
+    # it would read a `kernelsu-next` payload back as plain KernelSU, so an
+    # entry that declares one keeps it.
+    if "flavor" in existing:
+        entry["flavor"] = existing["flavor"]
+    if args.preserve_existing_metadata and "requiresFreshP0Session" in existing:
+        entry["requiresFreshP0Session"] = existing["requiresFreshP0Session"]
+    elif args.requires_fresh_p0_session:
+        entry["requiresFreshP0Session"] = True
+    entry["exploit"] = {
+        "url": f"{raw_prefix}{exploit_rel}",
+        "size": args.exploit_path.stat().st_size,
     }
     # KernelSU is optional: pre-GKI kernels (e.g. Samsung 5.4) cannot run
     # ksud at all, so a port can legitimately ship without a kernelsu entry.
     if args.kernelsu_path and args.kernelsu_path.exists():
         kernelsu_rel = args.kernelsu_path.resolve().relative_to(repo.resolve()).as_posix()
-        entry["kernelsu"] = {
+        existing_ksud = existing.get("kernelsu")
+        existing_ksud = existing_ksud if isinstance(existing_ksud, dict) else {}
+        kernelsu = {
             "url": f"{raw_prefix}{kernelsu_rel}",
             "size": args.kernelsu_path.stat().st_size,
+            # The digest is mechanical, so this tool owns it: the app verifies
+            # the daemon it stages against it, and an entry that lost the field
+            # would be offered a download nothing can check.
+            "sha256": sha256_file(args.kernelsu_path),
         }
-    if args.preserve_existing_metadata and "requiresFreshP0Session" in existing:
-        entry["requiresFreshP0Session"] = existing["requiresFreshP0Session"]
-    elif args.requires_fresh_p0_session:
-        entry["requiresFreshP0Session"] = True
+        # The release a daemon was built from is not something this tool knows;
+        # it is written where the pair is built. The payload id spells one out
+        # (`ksu330`), but not faithfully - `rsksu420` cannot tell `4.2.0` from
+        # `4.2.0-rc3` - so the declared value is carried over rather than
+        # guessed from the id.
+        if existing_ksud.get("version"):
+            kernelsu["version"] = existing_ksud["version"]
+        entry["kernelsu"] = kernelsu
     # work in LF-normalized text (read_text already normalized), then restore
     # the file's original line endings at write time so a no-op update is
     # byte-for-byte identical
