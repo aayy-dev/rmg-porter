@@ -1,0 +1,664 @@
+name: S25 FE Port PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      payloads_repo:
+        description: owner/repo for Root-My-Galaxy-Payloads
+        required: true
+        default: "rtrdd-dev/rmg"
+      profile:
+        description: payload profile, for example a36xq-A366WVLS3AYG1
+        required: true
+        default: "s25fe-S731U1UES7BZF3-port"
+      payload_id:
+        description: support feed payloadId; defaults to profile for one-profile payloads
+        required: false
+        default: "s25fe-S731U1UES7BZF3-port"
+      model:
+        description: exact Build.MODEL, for example SM-A366W
+        required: true
+        default: "SM-S731U1"
+      region:
+        description: Samsung CSC/region
+        required: true
+        default: "XAA"
+      version:
+        description: four-part Samsung firmware version from samloader, or latest
+        required: true
+        default: "S731U1UES7BZF3/S731U1OYM7BZF3/S731U1UES7BZF3/S731U1UES7BZF3"
+      firmware_url:
+        description: optional direct firmware zip URL; if empty, samloader is used
+        required: false
+      source_target:
+        description: existing target used as the header scaffold (structure, phys load, event id, pselect shift)
+        required: true
+        default: "s25fe-S731U1UES7BZF3-stable"
+      replace_existing_target:
+        description: allow replacing an existing target in the CI checkout
+        required: true
+        default: "false"
+      create_port_doc:
+        description: create a generated docs/<model>-<build>.md provenance stub
+        required: true
+        default: "true"
+      preserve_existing_feed_metadata:
+        description: preserve models/displayName/kernelVersions for an existing payloadId
+        required: true
+        default: "true"
+      require_btf:
+        description: require raw BTF extraction; set false for documented no-BTF legacy ports
+        required: true
+        default: "true"
+      require_analysis_artifacts:
+        description: require recovered vmlinux nm/BTF/KernelSU audit artifacts
+        required: true
+        default: "false"
+      probe_offset:
+        description: P0 probe offset for p0_fingerprint.h
+        required: true
+        default: "0x1f0000"
+      kernel_version:
+        description: leading uname -r version used by targets-v3.json, for example 6.6.46; auto-detected from the kernel banner when empty
+        required: false
+        default: ""
+      kernel_release:
+        description: full kernel release/vermagic; auto-detected from the kernel banner when empty
+        required: false
+      fingerprint:
+        description: ro.build.fingerprint for BUILD_FINGERPRINT when the firmware zip has no meta-data/fota.zip (provenance metadata only)
+        required: false
+        default: ""
+      release_size_max:
+        description: maximum release payload size in bytes
+        required: true
+        default: "200000"
+      ndk_version:
+        description: Android NDK version to install with sdkmanager
+        required: true
+        default: "29.0.14206865"
+      display_name:
+        description: support feed display name
+        required: true
+        default: "Galaxy S25 FE (port) | Kernel 6.1.157"
+      kernelsu_build:
+        description: reuse an existing ksud artifact (same KMI), build a fresh module+ksud in the DDK container, or skip
+        required: true
+        default: "ddk"
+      kernelsu_artifact:
+        description: existing KernelSU path in payload repo for reuse mode, for example kernelsu/ksud-A366WVLS3AYG1-kdp
+        required: true
+        default: "kernelsu/ksud-s25fe-S731U1UES7BZF3-kdp-v3.3.1"
+      kernelsu_ddk_json:
+        description: 'JSON for kernelsu_build=ddk: image (DDK container), release (target vermagic release), kmi_asset (embedded KO name), for example {"image":"ghcr.io/ylarod/ddk-min:android14-6.1-20260313","kmi_asset":"android14-6.1_kernelsu.ko"}'
+        required: false
+        default: '{"image":"ghcr.io/ylarod/ddk-min:android14-6.1-20260313","kmi_asset":"android14-6.1_kernelsu.ko"}'
+      kernelsu_options_json:
+        description: 'optional JSON for KO/build/audit paths, KernelSU source build settings, and allow_build_mismatch (re-port when the exact committed build is retired from FUS), for example {"allow_build_mismatch": true}'
+        required: false
+        default: "{}"
+      dry_run:
+        description: build and validate, but do not open a PR
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  port:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout porter
+        uses: actions/checkout@v4
+        with:
+          path: porter
+
+      - name: Checkout payloads
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.payloads_repo }}
+          token: ${{ secrets.PAYLOADS_PR_TOKEN || github.token }}
+          path: payloads
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip tar make clang llvm lz4 python3-pip kmod \
+            git gcc libelf-dev zlib1g-dev
+
+      - name: Install porter
+        run: |
+          python3 -m pip install ./porter[lz4]
+          python3 -m pip install vmlinux-to-elf pyelftools
+
+      - name: Prepare optional bpftool
+        run: |
+          # On ubuntu-24.04, /usr/bin/bpftool is a linux-tools-common wrapper that
+          # resolves a per-kernel binary and exits non-zero when the runner kernel's
+          # linux-tools package is missing. Probe each candidate and keep the first
+          # one that actually runs; if none works, BPFTOOL stays empty and the raw
+          # BTF header validation plus the pure-Python btf-struct dump still gate
+          # the porting step.
+          candidate="$(command -v bpftool || true)"
+          if [ -n "$candidate" ] && "$candidate" version >/dev/null 2>&1; then
+            echo "BPFTOOL=$candidate" >> "$GITHUB_ENV"
+            echo "bpftool: $candidate"
+          else
+            for bin in $(find /usr/lib/linux-tools-* -name bpftool -type f 2>/dev/null | sort -V); do
+              if "$bin" version >/dev/null 2>&1; then
+                candidate="$bin"
+                echo "BPFTOOL=$bin" >> "$GITHUB_ENV"
+                echo "bpftool: $bin"
+                break
+              fi
+            done
+          fi
+          if [ -z "${candidate:-}" ]; then
+            echo "BPFTOOL=" >> "$GITHUB_ENV"
+            echo "bpftool unavailable; btf-struct (pure Python) and raw BTF header validation still run."
+          fi
+
+      - name: Install Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;${{ inputs.ndk_version }}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ inputs.ndk_version }}" >> "$GITHUB_ENV"
+
+      - name: Download firmware
+        working-directory: porter
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          mkdir -p ".work/${{ inputs.profile }}"
+          if [ -n "${{ inputs.firmware_url }}" ]; then
+            version="${{ inputs.version }}"
+            curl -L --fail --retry 5 \
+              -o ".work/${{ inputs.profile }}/firmware.zip" \
+              "${{ inputs.firmware_url }}"
+          else
+            cargo install samloader --locked
+            version="${{ inputs.version }}"
+            if [ "$version" = "latest" ]; then
+              samloader check-update \
+                --model "${{ inputs.model }}" \
+                --region "${{ inputs.region }}" \
+                --all \
+                --verbose | tee ".work/${{ inputs.profile }}/samloader-check-update.txt"
+              version="$(rmg-port samloader-version \
+                --check-update-file ".work/${{ inputs.profile }}/samloader-check-update.txt")"
+              echo "Resolved latest stable firmware version: $version"
+            fi
+            samloader download \
+              --model "${{ inputs.model }}" \
+              --region "${{ inputs.region }}" \
+              --version "$version" \
+              --out-file ".work/${{ inputs.profile }}/firmware.zip"
+          fi
+          echo "$version" > ".work/${{ inputs.profile }}/resolved-version.txt"
+
+      - name: Extract kernel and generated headers
+        working-directory: porter
+        run: |
+          rmg-port init \
+            --profile "${{ inputs.profile }}" \
+            --model "${{ inputs.model }}" \
+            --region "${{ inputs.region }}" \
+            --version "$(cat ".work/${{ inputs.profile }}/resolved-version.txt")" \
+            --workdir ".work/${{ inputs.profile }}"
+          rmg-port extract-kernel \
+            --firmware-zip ".work/${{ inputs.profile }}/firmware.zip" \
+            --workdir ".work/${{ inputs.profile }}"
+          rmg-port extract-fota \
+            --firmware-zip ".work/${{ inputs.profile }}/firmware.zip" \
+            --out ".work/${{ inputs.profile }}/fota-props.json" || true
+          rmg-port extract-btf \
+            --kernel ".work/${{ inputs.profile }}/kernel" \
+            --out ".work/${{ inputs.profile }}/vmlinux.btf" || true
+          if [ -f ".work/${{ inputs.profile }}/vmlinux.btf" ]; then
+            rmg-port btf-struct \
+              --btf ".work/${{ inputs.profile }}/vmlinux.btf" \
+              --out ".work/${{ inputs.profile }}/struct-offsets.json" \
+              --structs all
+          fi
+          if command -v vmlinux-to-elf >/dev/null 2>&1; then
+            vmlinux-to-elf ".work/${{ inputs.profile }}/kernel" \
+              ".work/${{ inputs.profile }}/vmlinux.elf"
+          else
+            python3 -m vmlinux_to_elf ".work/${{ inputs.profile }}/kernel" \
+              ".work/${{ inputs.profile }}/vmlinux.elf"
+          fi
+          llvm-nm --numeric-sort ".work/${{ inputs.profile }}/vmlinux.elf" \
+            > ".work/${{ inputs.profile }}/vmlinux.nm"
+          llvm-objdump --disassemble-symbols=worker_thread \
+            ".work/${{ inputs.profile }}/vmlinux.elf" \
+            > ".work/${{ inputs.profile }}/worker_thread.objdump" || true
+          if ! grep -qE '^\s*[0-9a-f]{16}:' ".work/${{ inputs.profile }}/worker_thread.objdump"; then
+            # a failed --disassemble-symbols run still writes a non-empty header,
+            # so detect missing disassembly by the absence of address lines.
+            # Vendor kernels mangle kallsyms names in two ways: Samsung's
+            # $<32-hex> hash (worker_thread$f31e...) and LLVM LTO's
+            # .llvm.<digits> suffix (worker_thread.llvm.7975...). Retry with
+            # the real symbol name for whichever scheme is present.
+            mangled="$(grep -Eo 'worker_thread(\$[0-9a-f]{32}|\.llvm\.[0-9]+)' ".work/${{ inputs.profile }}/vmlinux.nm" | head -1)"
+            if [ -n "$mangled" ]; then
+              llvm-objdump --disassemble-symbols="$mangled" \
+                ".work/${{ inputs.profile }}/vmlinux.elf" \
+                > ".work/${{ inputs.profile }}/worker_thread.objdump" || true
+            fi
+          fi
+          if [ -n "$BPFTOOL" ] && [ -f ".work/${{ inputs.profile }}/vmlinux.btf" ]; then
+            "$BPFTOOL" btf dump file ".work/${{ inputs.profile }}/vmlinux.btf" format raw \
+              > ".work/${{ inputs.profile }}/vmlinux-btf.raw" || true
+          fi
+          rmg-port gen-p0 \
+            --kernel ".work/${{ inputs.profile }}/kernel" \
+            --probe-offset "${{ inputs.probe_offset }}" \
+            --out ".work/${{ inputs.profile }}/p0_fingerprint.h"
+
+      - name: Scaffold target in payload repo
+        working-directory: porter
+        env:
+          REPLACE_EXISTING_TARGET: ${{ inputs.replace_existing_target }}
+          CREATE_PORT_DOC: ${{ inputs.create_port_doc }}
+        run: |
+          replace_arg=""
+          if [ "$REPLACE_EXISTING_TARGET" = "true" ]; then
+            replace_arg="--replace-existing"
+          fi
+          rmg-port scaffold-target \
+            --payloads-repo ../payloads \
+            --profile "${{ inputs.profile }}" \
+            --source-target "${{ inputs.source_target }}" \
+            --p0-header ".work/${{ inputs.profile }}/p0_fingerprint.h" \
+            --skip-target-header \
+            $replace_arg
+
+      - name: Derive target header from this firmware
+        working-directory: porter
+        env:
+          CREATE_PORT_DOC: ${{ inputs.create_port_doc }}
+        run: |
+          w=".work/${{ inputs.profile }}"
+          derive_args=""
+          [ -f "$w/fota-props.json" ] && derive_args="$derive_args --fota-props $w/fota-props.json"
+          if [ -n "${{ inputs.fingerprint }}" ]; then
+            derive_args="$derive_args --fingerprint ${{ inputs.fingerprint }}"
+          fi
+          [ -f "$w/vmlinux.nm" ] && derive_args="$derive_args --vmlinux-nm $w/vmlinux.nm"
+          [ -f "$w/vmlinux.elf" ] && derive_args="$derive_args --vmlinux-elf $w/vmlinux.elf"
+          [ -f "$w/struct-offsets.json" ] && derive_args="$derive_args --struct-offsets $w/struct-offsets.json"
+          [ -f "$w/worker_thread.objdump" ] && derive_args="$derive_args --worker-objdump $w/worker_thread.objdump"
+          # Prefer the profile's OWN committed header as the derive template so
+          # never-derived macros (SLIDE_NFULNL_LOGGER_NAME_OFF, ...) keep their
+          # device-tested values. scaffold-target preserves the committed files
+          # as <profile>.source-backup whenever the profile already exists; a
+          # foreign source_target is only used for genuinely new profiles.
+          template="../payloads/src/targets/${{ inputs.profile }}.source-backup/target.h"
+          if [ ! -f "$template" ]; then
+            template="../payloads/src/targets/${{ inputs.profile }}/target.h"
+          fi
+          if [ ! -f "$template" ]; then
+            template="../payloads/src/targets/${{ inputs.source_target }}/target.h"
+          fi
+          if [ ! -f "$template" ]; then
+            template="../payloads/src/targets/${{ inputs.source_target }}.source-backup/target.h"
+          fi
+          if [ ! -f "$template" ]; then
+            echo "no target.h template found (profile or source_target) for ${{ inputs.profile }}" >&2
+            exit 1
+          fi
+          echo "using derive template: $template"
+          rmg-port gen-target-h \
+            --target-dir "../payloads/src/targets/${{ inputs.profile }}" \
+            --template "$template" \
+            --profile "${{ inputs.profile }}" \
+            $derive_args
+          if [ "$CREATE_PORT_DOC" = "true" ]; then
+            kernel_release="${{ inputs.kernel_release }}"
+            if [ -f "$w/kernel-release.txt" ]; then
+              kernel_release="$(cat "$w/kernel-release.txt")"
+            fi
+            rmg-port write-port-doc \
+              --payloads-repo ../payloads \
+              --profile "${{ inputs.profile }}" \
+              --model "${{ inputs.model }}" \
+              --region "${{ inputs.region }}" \
+              --version "$(cat "$w/resolved-version.txt")" \
+              --kernel "$w/kernel" \
+              --kernel-release "$kernel_release"
+          fi
+
+      - name: Build release payload
+        working-directory: payloads
+        run: |
+          test -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+          make TARGET="${{ inputs.profile }}" release
+          mkdir -p "artifacts/${{ inputs.profile }}"
+          cp "build/${{ inputs.profile }}/cve-2026-43499-app.release.so" \
+             "artifacts/${{ inputs.profile }}/cve-2026-43499-app.so"
+
+      - name: Build and audit KernelSU module
+        working-directory: porter
+        env:
+          KERNELSU_BUILD_MODE: ${{ inputs.kernelsu_build }}
+          KERNELSU_OPTIONS_JSON: ${{ inputs.kernelsu_options_json }}
+          KERNELSU_DDK_JSON: ${{ inputs.kernelsu_ddk_json }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          set -euo pipefail
+          python3 -c 'import json, os, shlex; opts=json.loads(os.environ.get("KERNELSU_OPTIONS_JSON") or "{}"); keys=("source_repo","source_ref","patch_path","build_command","built_ko_path","manual_relocation"); print("\n".join("KERNELSU_%s=%s" % (k.upper(), shlex.quote(str(opts.get(k) or ""))) for k in keys))' > ".work/kernelsu-options.env"
+          . ".work/kernelsu-options.env"
+          python3 -c 'import json, os, shlex; opts=json.loads(os.environ.get("KERNELSU_DDK_JSON") or "{}"); keys=("image","release","kmi_asset"); print("\n".join("KERNELSU_DDK_%s=%s" % (k.upper(), shlex.quote(str(opts.get(k) or ""))) for k in keys))' > ".work/kernelsu-ddk.env"
+          . ".work/kernelsu-ddk.env"
+          profile="${{ inputs.profile }}"
+          w=".work/$profile"
+          echo "${{ inputs.kernelsu_artifact }}" > ".work/kernelsu-artifact-path.txt"
+
+          if [ "$KERNELSU_BUILD_MODE" = "none" ]; then
+            echo "KernelSU build skipped (kernelsu_build=none)."
+            exit 0
+          fi
+
+          if [ "$KERNELSU_BUILD_MODE" = "ddk" ]; then
+            if [ -z "$KERNELSU_DDK_IMAGE" ]; then
+              echo "kernelsu_build=ddk requires kernelsu_ddk_json.image (for example ghcr.io/ylarod/ddk-min:android14-6.1-20260313)." >&2
+              exit 1
+            fi
+            release="${KERNELSU_DDK_RELEASE:-}"
+            if [ -z "$release" ] && [ -f "$w/kernel-release.txt" ]; then
+              release="$(cat "$w/kernel-release.txt")"
+            fi
+            if [ -z "$release" ]; then
+              echo "kernelsu_build=ddk needs kernelsu_ddk_json.release or an auto-detected kernel release." >&2
+              exit 1
+            fi
+            kmi_asset="${KERNELSU_DDK_KMI_ASSET:-android15-6.6_kernelsu.ko}"
+            echo "Building KernelSU module for release: $release (kmi asset: $kmi_asset)"
+            git clone --depth 1 --branch v3.2.5 https://github.com/tiann/KernelSU.git ".work/kernelsu-src"
+            git -C ".work/kernelsu-src" apply ../payloads/kernelsu/patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch
+            docker run --rm \
+              -v "$PWD/.work/kernelsu-src:/workspace" \
+              -w /workspace/kernel \
+              -e "KSU_RELEASE=$release" \
+              "$KERNELSU_DDK_IMAGE" \
+              bash -lc '
+                set -e
+                default_release="$(sed -n "s/.*\"\([^\"]*\)\".*/\1/p" "$KDIR/include/generated/utsrelease.h" | head -1)"
+                sed -i "s|$default_release|$KSU_RELEASE|g" \
+                  "$KDIR/include/generated/utsrelease.h" \
+                  "$KDIR/include/config/kernel.release"
+                make clean
+                CONFIG_KSU=m \
+                CONFIG_KSU_SAMSUNG_KDP=y \
+                CONFIG_KSU_SAMSUNG_RKP=y \
+                CONFIG_KSU_SAMSUNG_DEFEX=y \
+                CC=clang make -j"$(nproc)"
+                modinfo ./kernelsu.ko
+              '
+            built_ko=".work/kernelsu-src/kernel/kernelsu.ko"
+            test -f "$built_ko"
+            modinfo "$built_ko" | tee "$w/kernelsu.modinfo"
+            python3 ../payloads/kernelsu/tools/extract_target_symvers.py \
+              "$w/vmlinux.elf" "$w/Module.symvers"
+            ".work/kernelsu-src/kernel/check_symbol" \
+              "$built_ko" "$w/vmlinux.elf" | tee "$w/check_symbol.log"
+            python3 ../payloads/kernelsu/tools/audit_module_against_target.py \
+              "$built_ko" "$w/vmlinux.elf" "$w/Module.symvers" \
+              --manual-relocation | tee "$w/module_audit.log"
+            llvm-strip -d "$built_ko"
+            asset_dir=".work/kernelsu-src/userspace/ksud/bin/aarch64"
+            mkdir -p "$asset_dir"
+            cp "$built_ko" "$asset_dir/$kmi_asset"
+            touch "$asset_dir/$kmi_asset"
+            rustup target add aarch64-linux-android
+            ndk_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            export LIBCLANG_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib"
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ndk_bin/aarch64-linux-android35-clang"
+            export CC_aarch64_linux_android="$ndk_bin/aarch64-linux-android35-clang"
+            export AR_aarch64_linux_android="$ndk_bin/llvm-ar"
+            export PATH="$ndk_bin:$PATH"
+            (cd ".work/kernelsu-src/userspace/ksud" && cargo build --release --target aarch64-linux-android)
+            ksud_bin=".work/kernelsu-src/userspace/ksud/target/aarch64-linux-android/release/ksud"
+            test -f "$ksud_bin"
+            mkdir -p ../payloads/kernelsu
+            cp "$ksud_bin" "../payloads/kernelsu/ksud-$profile-kdp"
+            ko_name="${kmi_asset%.ko}"
+            cp "$built_ko" "../payloads/kernelsu/${ko_name}-$profile-kdp.ko"
+            echo "kernelsu/ksud-$profile-kdp" > ".work/kernelsu-artifact-path.txt"
+            echo "${ko_name}-$profile-kdp.ko" > ".work/kernelsu-ko-path.txt"
+            echo "KernelSU DDK build complete: kernelsu/ksud-$profile-kdp + ${ko_name}-$profile-kdp.ko"
+            exit 0
+          fi
+
+          # custom source build via kernelsu_options_json (legacy path)
+          if [ -n "$KERNELSU_SOURCE_REPO" ] && [ -n "$KERNELSU_BUILD_COMMAND" ]; then
+            if [ -z "$KERNELSU_SOURCE_REF" ]; then
+              KERNELSU_SOURCE_REF="v3.2.5"
+            fi
+            if [ -z "$KERNELSU_BUILT_KO_PATH" ]; then
+              KERNELSU_BUILT_KO_PATH="kernel/kernelsu.ko"
+            fi
+            if [ -z "$KERNELSU_MANUAL_RELOCATION" ]; then
+              KERNELSU_MANUAL_RELOCATION="true"
+            fi
+            git clone --depth 1 --branch "$KERNELSU_SOURCE_REF" "$KERNELSU_SOURCE_REPO" ".work/kernelsu-src"
+            if [ -n "$KERNELSU_PATCH_PATH" ]; then
+              git -C ".work/kernelsu-src" apply "$(pwd)/../payloads/$KERNELSU_PATCH_PATH"
+            fi
+            bash -lc "cd '.work/kernelsu-src' && $KERNELSU_BUILD_COMMAND"
+            built_ko=".work/kernelsu-src/$KERNELSU_BUILT_KO_PATH"
+            test -f "$built_ko"
+            modinfo "$built_ko" | tee "$w/kernelsu.modinfo"
+            python3 ../payloads/kernelsu/tools/extract_target_symvers.py \
+              "$w/vmlinux.elf" "$w/Module.symvers"
+            if [ -x ".work/kernelsu-src/kernel/check_symbol" ]; then
+              ".work/kernelsu-src/kernel/check_symbol" \
+                "$built_ko" "$w/vmlinux.elf" | tee "$w/check_symbol.log"
+            fi
+            audit_args=""
+            if [ "$KERNELSU_MANUAL_RELOCATION" = "true" ]; then
+              audit_args="--manual-relocation"
+            fi
+            python3 ../payloads/kernelsu/tools/audit_module_against_target.py \
+              "$built_ko" "$w/vmlinux.elf" "$w/Module.symvers" \
+              $audit_args | tee "$w/module_audit.log"
+            exit 0
+          fi
+
+          echo "KernelSU: reusing ${{ inputs.kernelsu_artifact }} (kernelsu_build=reuse)."
+
+      - name: Update support feed and validate
+        working-directory: porter
+        env:
+          PRESERVE_EXISTING_FEED_METADATA: ${{ inputs.preserve_existing_feed_metadata }}
+          REQUIRE_BTF: ${{ inputs.require_btf }}
+          REQUIRE_ANALYSIS_ARTIFACTS: ${{ inputs.require_analysis_artifacts }}
+          KERNELSU_OPTIONS_JSON: ${{ inputs.kernelsu_options_json }}
+        run: |
+          set -euo pipefail
+          python3 -c 'import json, os, shlex; opts=json.loads(os.environ.get("KERNELSU_OPTIONS_JSON") or "{}"); keys=("ko_artifact","check_symbol_log","module_audit_log"); print("\n".join("KERNELSU_%s=%s" % (k.upper(), shlex.quote(str(opts.get(k) or ""))) for k in keys))' > ".work/kernelsu-options.env"
+          . ".work/kernelsu-options.env"
+          profile="${{ inputs.profile }}"
+          w=".work/$profile"
+          kernel_release="${{ inputs.kernel_release }}"
+          if [ -f "$w/kernel-release.txt" ]; then
+            kernel_release="$(cat "$w/kernel-release.txt")"
+          fi
+          kernel_version="${{ inputs.kernel_version }}"
+          if [ -z "$kernel_version" ] && [ -f "$w/kernel-release.txt" ]; then
+            kernel_version="$(sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/' < "$w/kernel-release.txt")"
+            echo "kernel_version auto-detected: $kernel_version"
+          fi
+          if [ -z "$kernel_version" ]; then
+            echo "kernel_version input is empty and no kernel release was detected from the firmware." >&2
+            exit 1
+          fi
+          ksud_path="$(cat ".work/kernelsu-artifact-path.txt" 2>/dev/null || echo '${{ inputs.kernelsu_artifact }}')"
+          # kernelsu_build=none ports ship without a ksud artifact (pre-GKI kernels
+          # like Samsung 5.4 cannot run KernelSU): omit the kernelsu path entirely
+          # so add-feed-entry and validate-port handle the optional entry.
+          ksud_arg=""
+          if [ "${{ inputs.kernelsu_build }}" != "none" ] && [ -n "$ksud_path" ]; then
+            ksud_arg="--kernelsu-path ../payloads/$ksud_path"
+          fi
+          preserve_arg=""
+          if [ "$PRESERVE_EXISTING_FEED_METADATA" = "true" ]; then
+            preserve_arg="--preserve-existing-metadata"
+          fi
+          btf_arg=""
+          if [ "$REQUIRE_BTF" = "true" ]; then
+            # always pass the path: validate-port fails loudly when it is missing
+            btf_arg="--btf $w/vmlinux.btf"
+          fi
+          ko_arg=""
+          if [ -f ".work/kernelsu-ko-path.txt" ]; then
+            ko_rel="$(cat ".work/kernelsu-ko-path.txt")"
+            ko_arg="--kernelsu-ko-path ../payloads/kernelsu/$ko_rel"
+            modinfo "../payloads/kernelsu/$ko_rel" > "$w/kernelsu.modinfo"
+          elif [ -n "$KERNELSU_KO_ARTIFACT" ]; then
+            ko_arg="--kernelsu-ko-path ../payloads/$KERNELSU_KO_ARTIFACT"
+            modinfo "../payloads/$KERNELSU_KO_ARTIFACT" > "$w/kernelsu.modinfo"
+          fi
+          check_symbol_arg=""
+          if [ -n "$KERNELSU_CHECK_SYMBOL_LOG" ]; then
+            check_symbol_arg="--check-symbol-log ../payloads/$KERNELSU_CHECK_SYMBOL_LOG"
+          elif [ -f "$w/check_symbol.log" ]; then
+            check_symbol_arg="--check-symbol-log $w/check_symbol.log"
+          fi
+          module_audit_arg=""
+          if [ -n "$KERNELSU_MODULE_AUDIT_LOG" ]; then
+            module_audit_arg="--module-audit-log ../payloads/$KERNELSU_MODULE_AUDIT_LOG"
+          elif [ -f "$w/module_audit.log" ]; then
+            module_audit_arg="--module-audit-log $w/module_audit.log"
+          fi
+          rmg-port add-feed-entry \
+            --payloads-repo ../payloads \
+            --profile "$profile" \
+            --payload-id "${{ inputs.payload_id || inputs.profile }}" \
+            --display-name "${{ inputs.display_name }}" \
+            --model "${{ inputs.model }}" \
+            --kernel-version "$kernel_version" \
+            --exploit-path "../payloads/artifacts/$profile/cve-2026-43499-app.so" \
+            $ksud_arg \
+            $preserve_arg
+          rmg-port validate-feed --payloads-repo ../payloads
+          allow_mismatch=""
+          if [ "$(echo "$KERNELSU_OPTIONS_JSON" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read() or "{}").get("allow_build_mismatch", False))' 2>/dev/null)" = "True" ]; then
+            allow_mismatch="--allow-profile-build-mismatch"
+          fi
+          rmg-port validate-port \
+            --payloads-repo ../payloads \
+            --profile "$profile" \
+            --payload-id "${{ inputs.payload_id || inputs.profile }}" \
+            --version "$(cat "$w/resolved-version.txt")" \
+            --kernel-version "$kernel_version" \
+            --kernel-release "$kernel_release" \
+            --release-size-max "${{ inputs.release_size_max }}" \
+            --kernel "$w/kernel" \
+            $ksud_arg \
+            $ko_arg \
+            $btf_arg \
+            $allow_mismatch
+          analysis_args=""
+          if [ -f "$w/struct-offsets.json" ]; then
+            analysis_args="$analysis_args --struct-offsets $w/struct-offsets.json"
+          fi
+          if [ -f "$w/vmlinux-btf.raw" ]; then
+            analysis_args="$analysis_args --btf-raw $w/vmlinux-btf.raw"
+          fi
+          if [ -s "$w/worker_thread.objdump" ]; then
+            analysis_args="$analysis_args --worker-objdump $w/worker_thread.objdump"
+          fi
+          if [ -f "$w/kernelsu.modinfo" ]; then
+            analysis_args="$analysis_args --modinfo $w/kernelsu.modinfo"
+          fi
+          if [ "$REQUIRE_ANALYSIS_ARTIFACTS" = "true" ] || [ -f "$w/vmlinux.nm" ]; then
+            rmg-port validate-analysis \
+              --payloads-repo ../payloads \
+              --profile "$profile" \
+              --vmlinux-nm "$w/vmlinux.nm" \
+              --kernel-release "$kernel_release" \
+              $analysis_args \
+              $check_symbol_arg \
+              $module_audit_arg
+          fi
+          rmg-port checklist --payloads-repo ../payloads --profile "$profile"
+
+      - name: Upload port bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: port-${{ inputs.profile }}
+          if-no-files-found: warn
+          path: |
+            porter/.work/${{ inputs.profile }}/kernel
+            porter/.work/${{ inputs.profile }}/vmlinux.nm
+            porter/.work/${{ inputs.profile }}/vmlinux.elf
+            porter/.work/${{ inputs.profile }}/vmlinux.btf
+            porter/.work/${{ inputs.profile }}/struct-offsets.json
+            porter/.work/${{ inputs.profile }}/fota-props.json
+            porter/.work/${{ inputs.profile }}/kernel-release.txt
+            porter/.work/${{ inputs.profile }}/resolved-version.txt
+            porter/.work/${{ inputs.profile }}/p0_fingerprint.h
+            porter/.work/${{ inputs.profile }}/worker_thread.objdump
+            porter/.work/${{ inputs.profile }}/vmlinux-btf.raw
+            porter/.work/${{ inputs.profile }}/kernelsu.modinfo
+            porter/.work/${{ inputs.profile }}/check_symbol.log
+            porter/.work/${{ inputs.profile }}/module_audit.log
+            payloads/src/targets/${{ inputs.profile }}
+            payloads/artifacts/${{ inputs.profile }}
+            payloads/support/targets-v3.json
+            payloads/kernelsu/ksud-${{ inputs.profile }}-kdp
+            payloads/kernelsu/*_kernelsu-${{ inputs.profile }}-kdp.ko
+
+      - name: Open pull request
+        if: ${{ inputs.dry_run != 'true' }}
+        working-directory: payloads
+        env:
+          GH_TOKEN: ${{ secrets.PAYLOADS_PR_TOKEN }}
+          PAYLOADS_PR_TOKEN: ${{ secrets.PAYLOADS_PR_TOKEN }}
+        run: |
+          if [ -z "$PAYLOADS_PR_TOKEN" ]; then
+            echo "PAYLOADS_PR_TOKEN secret is not set; skipping PR creation." >&2
+            echo "Add a PAT (repo scope) as the PAYLOADS_PR_TOKEN secret to open the PR." >&2
+            exit 1
+          fi
+          branch="device-port/${{ inputs.profile }}"
+          git config user.name "rootmygalaxy-device-porter"
+          git config user.email "rootmygalaxy-device-porter@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add "src/targets/${{ inputs.profile }}" \
+                  "artifacts/${{ inputs.profile }}" \
+                  support/targets-v3.json \
+                  docs
+          if ls kernelsu/ksud-${{ inputs.profile }}-kdp >/dev/null 2>&1; then
+            git add "kernelsu/ksud-${{ inputs.profile }}-kdp"
+          fi
+          # KO names differ per target (android14-6.1_kernelsu-<profile>-kdp.ko vs
+          # android13-5.15.189_kernelsu-<profile>.ko); tolerate either pattern
+          git add kernelsu/*_kernelsu-${{ inputs.profile }}-kdp.ko 2>/dev/null || true
+          git add kernelsu/*_kernelsu-${{ inputs.profile }}.ko 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No payload changes after validation; skipping PR creation."
+            exit 0
+          fi
+          git commit -m "Add ${{ inputs.profile }} payload profile"
+          git remote set-url origin "https://x-access-token:${PAYLOADS_PR_TOKEN}@github.com/${{ inputs.payloads_repo }}.git"
+          # the branch may already exist from an earlier run (e.g. a closed PR);
+          # fetch it so the force-with-lease lease is valid, then force over it
+          git fetch origin "$branch" 2>/dev/null || true
+          git push --force-with-lease origin "$branch"
+          # the branch may already have an open PR from a previous run; in that
+          # case the force-push above already updated it, so just point at it
+          if gh pr view "$branch" --repo "${{ inputs.payloads_repo }}" >/dev/null 2>&1; then
+            echo "PR for $branch already exists; the force-push above updated it."
+            gh pr view "$branch" --repo "${{ inputs.payloads_repo }}" --json number,url --jq '"number=" + (.number|tostring) + " url=" + .url'
+            exit 0
+          fi
+          gh pr create \
+            --repo "${{ inputs.payloads_repo }}" \
+            --base main \
+            --head "$branch" \
+            --title "Add ${{ inputs.profile }} payload profile" \
+            --body "Automated mechanical port PR. target.h was derived from this exact firmware (fota fingerprint, recovered vmlinux nm offsets, raw BTF struct offsets); see src/targets/${{ inputs.profile }}/port-report.md for what was derived vs scaffolded. Manual review still required for scaffolded constants (P0_PHYS_OFFSET/P0_KERNEL_PHYS_LOAD, SLIDE_TRACEFS_EVENT_ID, SLIDE_PSELECT_WORD_SHIFT, fake-task layout) and hardware validation before merge."
